@@ -12,13 +12,35 @@
 #include <cmath>
 
 #include "loadfile.hpp"
-#include "polar_grid_image_cluster.h"
 
 #define PCL_NO_PRECOMPILE
 using namespace std;
 
 const float PI = 3.1415926;
 
+
+// 定义grid中需要保存的数据
+struct Statistics {
+	int gridPointsNum;		// grid中的点数
+	float intensityMean;	// grid中点的平均intensity，在测试文件中的bin是以浮点数形式表示的，而txt是以整形表示的
+	int zMinPointID;		// 记录最小的z坐标对应的pointID
+	vector<int> gridToPointID;	// grid中的点的pointID
+	int gCandiFlag;			// 判断是否为地面候选网格的flag，0表示网格为空，-1表示非候选，1表示候选
+};
+
+// 定义转换的参数
+struct Param {
+	int width;
+	int height;
+	float range_xy_max;
+};
+
+// 定义地面分割参数
+struct gSegParam {
+	float th_slope;
+	float th_dist;
+	float th_zMin;
+};
 
 // 点云距离滤波
 void rangeFilter(	const pcl::PointCloud<pcl::PointXYZI>& cloudIn,
@@ -68,6 +90,7 @@ const int getGridNum(const Param& paramIn) {
 	return paramIn.height * paramIn.width;
 }
 
+
 // 获得每个point对应的网格的ID 
 void getGridID(const pcl::PointCloud<pcl::PointXYZI>& cloudIn, const Param& paramIn, vector<int>& gridIDOut) {
 	
@@ -113,29 +136,142 @@ void pc2GridMap(const pcl::PointCloud<pcl::PointXYZI>& cloudIn, const Param para
 			unordered_map<int, Statistics>& unordered_mapOut) {
 
 	int gridNum = getGridNum(paramIn);
-
+	Statistics statistic;
 	for (int i = 0; i < gridNum; ++i) {
-		auto keyRange = IDmapIn.equal_range(i);
 		int len = IDmapIn.count(i);
 		vector<int> pointID;
+		if(len == 0) {
+			statistic.gridPointsNum = 0;
+			statistic.gridToPointID = pointID;
+			statistic.intensityMean = 0;
+			statistic.zMinPointID = 0;
+			statistic.gCandiFlag = 0;
+			unordered_mapOut.insert(make_pair(i, statistic));
+			continue;
+		}
+		float intensitySum = 0;
+		auto keyRange = IDmapIn.equal_range(i);
+		int zMinPointID = keyRange.first->second;
 		for (auto it = keyRange.first; it != keyRange.second; ++it) {
 			pointID.push_back(it->second);
+			intensitySum += cloudIn.points[it->second].intensity;
+			if (cloudIn.points[it->second].z < cloudIn.points[zMinPointID].z) {
+				zMinPointID = it->second;
+			}
 		}
-		Statistics statistic;
 		statistic.gridPointsNum = len;
+		statistic.intensityMean = intensitySum / len;
+		statistic.zMinPointID = zMinPointID;
 		statistic.gridToPointID = pointID;
+		statistic.gCandiFlag = 0;	// 是否为地面候选的FLAG暂时定为0，另写函数修改这个flag
 		unordered_mapOut.insert(make_pair(i, statistic));
 	}
 }
 
+/******************************************/
+/************ Ground Remove****************/
+/******************************************/
+// 似乎param中只需要一个gridNum，用unordered_map的size即可，不用再多传这个参数
+void extract_grid_candidate(const pcl::PointCloud<pcl::PointXYZI>& cloudIn, 
+		unordered_map<int, Statistics>& unordered_mapInOut, gSegParam param) {
+	float th_zMin = param.th_zMin;
+	int gridNum = unordered_mapInOut.size();
+	for (int i = 0; i < gridNum; ++i) {
+		auto value = unordered_mapInOut.find(i); // 从map中找到key为i的值，因为map是无序的，因此必须这样找
+		int zMinPointID = value->second.zMinPointID;	// 找到后取出zMinPointID
+		if (value->second.gridPointsNum == 0) {
+			continue; // 表示该网格没有数据，unordered_mapInOut中的值不用动
+		} else if (cloudIn.points[zMinPointID].z < th_zMin) {
+			value->second.gCandiFlag = 1;	// 
+		} else {
+			value->second.gCandiFlag = -1;	// 表示该网格的点不可能是地面
+		}
+	}
+}
+
+float caud(const pcl::PointCloud<pcl::PointXYZI>& cloudIn, int i, int j) {
+	if (i == j) return 0;
+	
+	float dx = cloudIn.points[i].x - cloudIn.points[j].x;
+	float dy = cloudIn.points[i].y - cloudIn.points[j].y;
+	float dz = cloudIn.points[i].z - cloudIn.points[j].z;
+	return sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+float caua(const pcl::PointCloud<pcl::PointXYZI>& cloudIn, int i, int j) {
+	if (i == j) return 0;
+	float dx = cloudIn.points[i].x - cloudIn.points[j].x;
+	float dy = cloudIn.points[i].y - cloudIn.points[j].y;
+	float dz = cloudIn.points[i].z - cloudIn.points[j].z;
+	float theta = atan(fabs(dz) / sqrt(dx * dx + dy * dy)) * 180 / PI;
+	return theta;
+}
+
+
+
+// 参数有点太多了吧，其实候选点云，gGridCandiIn也可以归入到mapIn中，这样能少一个参数
+void GroundSeg(const pcl::PointCloud<pcl::PointXYZI>& cloudIn, 
+		const gSegParam param, unordered_map<int, Statistics>& unordered_mapIn, 
+		vector<int>& g_pcID, vector<int>& ng_pcID) {
+	float th_dist = param.th_dist;
+	float th_slope = param.th_slope;
+	int gridNum = unordered_mapIn.size();
+	for (int i = 0; i < gridNum; ++i) {
+		auto value = unordered_mapIn.find(i);
+		int gflag = value->second.gCandiFlag;
+		vector<int> PointID = value->second.gridToPointID;
+		if (gflag == 0) {
+			continue;
+		} else if (gflag == -1) {
+			for (int j = 0; j < PointID.size(); ++j) {
+				ng_pcID.push_back(PointID[j]);
+			}
+		} else {
+			for (int j = 0; j < PointID.size(); ++j) {
+				int ID0 = value->second.zMinPointID;
+				int IDp = PointID[j];
+				if (caud(cloudIn, ID0, IDp) < th_dist || caua(cloudIn, ID0, IDp) < th_slope) {
+					g_pcID.push_back(IDp);
+				} else {
+					ng_pcID.push_back(IDp);
+				}
+			}
+		}
+	}
+}
+
+void gReCallPort(const pcl::PointCloud<pcl::PointXYZI>& cloudIn, 
+		unordered_map<int, Statistics>& unordered_mapIn,
+		const gSegParam param, 
+		pcl::PointCloud<pcl::PointXYZI>& g_cloud, 
+		pcl::PointCloud<pcl::PointXYZI>& ng_cloud) {
+	
+	extract_grid_candidate(cloudIn, unordered_mapIn, param);
+	vector<int> g_pcID, ng_pcID;
+	GroundSeg(cloudIn, param, unordered_mapIn, g_pcID, ng_pcID);
+	for (int i = 0; i < g_pcID.size(); ++i) {
+		g_cloud.push_back(cloudIn.points[g_pcID[i]]);
+	}
+	for (int j = 0; j < ng_pcID.size(); ++j) {
+		ng_cloud.push_back(cloudIn.points[ng_pcID[j]]);
+	}
+}
 
 int main(int argc, char** argv) {
 
+	// 因为这里定义的都是指针，因此下文中函数参数那里统统都是*cloud等
 	pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(
 			new pcl::PointCloud<pcl::PointXYZI>);
 
 	pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_f(
 			new pcl::PointCloud<pcl::PointXYZI>);
+
+	pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_g(
+			new pcl::PointCloud<pcl::PointXYZI>);
+
+	pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_ng(
+			new pcl::PointCloud<pcl::PointXYZI>);
+
 	
 	fileToCloud(argv[1], cloud); // 不给模板参数，让编译器自己推导即可
 	
@@ -143,12 +279,19 @@ int main(int argc, char** argv) {
 	param.height = atoi(argv[2]);
 	param.width = atoi(argv[3]);
 	param.range_xy_max = atof(argv[4]);
+
+	gSegParam gparam;
+	gparam.th_zMin = -0.4;	// 如何知道这个参数值呢？这种做法看来还是有问题的
+	gparam.th_dist = 0.25;
+	gparam.th_slope = 25;
 	
 	rangeFilter(*cloud, *cloud_f, param.range_xy_max);	// 根据水平距离进行滤波
 	cout << "before rangeFilter:" << cloud->points.size() << endl;
 	cout << "after rangeFilter:" << cloud_f->points.size() << endl;
 
-	vector<int> gridID;
+	
+
+	vector<int> gridID;	
 	getGridID(*cloud_f, param, gridID);
 	// gridID转换为IDMap
 	unordered_multimap<int, int> IDMap;
@@ -157,6 +300,8 @@ int main(int argc, char** argv) {
 	// IDMap转化为GridMap
 	unordered_map<int, Statistics> pcGridMap;
 	pc2GridMap(*cloud_f, param, IDMap, pcGridMap);
+
+	gReCallPort(*cloud_f, pcGridMap, gparam, *cloud_g, *cloud_ng);
 
 	const int rowNum = param.height;
 	const int columnNum = param.width;
@@ -194,8 +339,8 @@ int main(int argc, char** argv) {
 	viewer->setBackgroundColor(0.8, 0.8, 0.8);
 	viewer->addCoordinateSystem(1);
 	// 原三维点云图也绘制出来
-	pcl::visualization::PointCloudColorHandlerCustom <pcl::PointXYZI> color(cloud_f, 0, 0, 0);
-	viewer->addPointCloud(cloud_f, color, "cloud");
+	pcl::visualization::PointCloudColorHandlerCustom <pcl::PointXYZI> color(cloud_g, 0, 0, 0);
+	viewer->addPointCloud(cloud_g, color, "cloud");
 
 	while (!viewer->wasStopped()) {
 		viewer->spin();
