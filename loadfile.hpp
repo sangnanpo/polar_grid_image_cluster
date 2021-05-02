@@ -1,5 +1,5 @@
-#ifndef __LOADFILE__
-#define __LOADFILE__
+#ifndef LOAD_FILE_
+#define LOAD_FILE_
 
 #include <iostream>
 #include <ostream>
